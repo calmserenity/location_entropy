@@ -3,7 +3,8 @@
 This module currently implements the early data-preparation steps of the
 project: discovering raw trace files, parsing each GPS observation, sorting
 each user trace into ascending timestamp order, assigning discrete location
-cells, and computing time-weighted location probabilities per user.
+cells, computing time-weighted location probabilities per user, and calculating
+location entropy from those probabilities.
 """
 
 from __future__ import annotations
@@ -108,6 +109,44 @@ class ProbabilityComputationResult:
     total_observed_seconds: int
     transitions_used: int
     transitions_skipped: int
+
+
+@dataclass(frozen=True, slots=True)
+class UserEntropyProfile:
+    """Location entropy metrics for one user.
+
+    Attributes:
+        user_id: Cab identifier derived from the filename.
+        entropy: Shannon entropy computed from the user's location
+            probabilities.
+        normalized_entropy: Entropy scaled to the `[0, 1]` range when the user
+            has more than one observed location.
+        num_locations: Number of locations with non-zero probability mass.
+        top_location_share: Largest single-location probability for the user.
+    """
+
+    user_id: str
+    entropy: float
+    normalized_entropy: float
+    num_locations: int
+    top_location_share: float
+
+
+@dataclass(frozen=True, slots=True)
+class EntropyComputationResult:
+    """Dataset-level output for location entropy metrics.
+
+    Attributes:
+        user_entropy_profiles: Per-user entropy summaries.
+        mean_entropy: Average entropy across all users.
+        min_entropy: Minimum entropy across all users.
+        max_entropy: Maximum entropy across all users.
+    """
+
+    user_entropy_profiles: list[UserEntropyProfile]
+    mean_entropy: float
+    min_entropy: float
+    max_entropy: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -451,9 +490,82 @@ def compute_location_probabilities(
     )
 
 
+def calculate_entropy(location_probabilities: dict[str, float]) -> float:
+    """Calculate Shannon entropy from a location probability distribution.
+
+    Args:
+        location_probabilities: Probability mass assigned to each location.
+
+    Returns:
+        Shannon entropy in bits.
+    """
+
+    return -sum(
+        probability * math.log2(probability)
+        for probability in location_probabilities.values()
+        if probability > 0
+    )
+
+
+def compute_entropy_metrics(
+    probabilities: ProbabilityComputationResult,
+) -> EntropyComputationResult:
+    """Compute per-user and dataset-level entropy metrics.
+
+    Args:
+        probabilities: Output from `compute_location_probabilities`.
+
+    Returns:
+        An `EntropyComputationResult` containing user-level entropy metrics and
+        aggregate summary statistics.
+    """
+
+    user_entropy_profiles: list[UserEntropyProfile] = []
+
+    for profile in probabilities.user_profiles:
+        entropy = calculate_entropy(profile.location_probabilities)
+        num_locations = len(profile.location_probabilities)
+        max_possible_entropy = math.log2(num_locations) if num_locations > 1 else 0.0
+        normalized_entropy = (
+            entropy / max_possible_entropy if max_possible_entropy > 0 else 0.0
+        )
+        top_location_share = (
+            max(profile.location_probabilities.values())
+            if profile.location_probabilities
+            else 0.0
+        )
+
+        user_entropy_profiles.append(
+            UserEntropyProfile(
+                user_id=profile.user_id,
+                entropy=entropy,
+                normalized_entropy=normalized_entropy,
+                num_locations=num_locations,
+                top_location_share=top_location_share,
+            )
+        )
+
+    if not user_entropy_profiles:
+        return EntropyComputationResult(
+            user_entropy_profiles=[],
+            mean_entropy=0.0,
+            min_entropy=0.0,
+            max_entropy=0.0,
+        )
+
+    entropy_values = [profile.entropy for profile in user_entropy_profiles]
+    return EntropyComputationResult(
+        user_entropy_profiles=user_entropy_profiles,
+        mean_entropy=sum(entropy_values) / len(entropy_values),
+        min_entropy=min(entropy_values),
+        max_entropy=max(entropy_values),
+    )
+
+
 def summarize_dataset(
     result: DatasetLoadResult,
     probabilities: ProbabilityComputationResult,
+    entropy_metrics: EntropyComputationResult,
     grid_size_degrees: float,
     max_gap_seconds: int | None,
 ) -> str:
@@ -462,6 +574,7 @@ def summarize_dataset(
     Args:
         result: Output from `assign_locations`.
         probabilities: Output from `compute_location_probabilities`.
+        entropy_metrics: Output from `compute_entropy_metrics`.
         grid_size_degrees: Spatial bin size used for location assignment.
         max_gap_seconds: Optional upper bound used when filtering large gaps.
 
@@ -474,6 +587,7 @@ def summarize_dataset(
 
     first_trace = result.traces[0]
     first_profile = probabilities.user_profiles[0]
+    first_entropy = entropy_metrics.user_entropy_profiles[0]
     first_start = first_trace.records[0].timestamp if first_trace.records else "n/a"
     first_end = first_trace.records[-1].timestamp if first_trace.records else "n/a"
     first_location = (
@@ -485,15 +599,10 @@ def summarize_dataset(
         for record in trace.records
         if record.location_id is not None
     }
-    top_location_share = (
-        max(first_profile.location_probabilities.values())
-        if first_profile.location_probabilities
-        else 0.0
-    )
 
     return "\n".join(
         [
-            "Step 3 complete: time-weighted location probabilities",
+            "Step 4 complete: location entropy calculation",
             f"Users loaded: {len(result.traces)}",
             f"Trace files processed: {result.files_seen}",
             f"Rows loaded: {result.rows_loaded}",
@@ -504,6 +613,9 @@ def summarize_dataset(
             f"Observed seconds used: {probabilities.total_observed_seconds}",
             f"Transitions used: {probabilities.transitions_used}",
             f"Transitions skipped: {probabilities.transitions_skipped}",
+            f"Mean entropy: {entropy_metrics.mean_entropy:.4f}",
+            f"Min entropy: {entropy_metrics.min_entropy:.4f}",
+            f"Max entropy: {entropy_metrics.max_entropy:.4f}",
             "",
             f"Example user: {first_trace.user_id}",
             f"Example records: {len(first_trace.records)}",
@@ -511,13 +623,15 @@ def summarize_dataset(
             f"Example first location cell: {first_location}",
             f"Example observed seconds: {first_profile.total_observed_seconds}",
             f"Example probability locations: {len(first_profile.location_probabilities)}",
-            f"Example top location share: {top_location_share:.4f}",
+            f"Example top location share: {first_entropy.top_location_share:.4f}",
+            f"Example entropy: {first_entropy.entropy:.4f}",
+            f"Example normalized entropy: {first_entropy.normalized_entropy:.4f}",
         ]
     )
 
 
 def main() -> int:
-    """Run the current step: load traces and compute location probabilities.
+    """Run the current step: load traces and compute location entropy.
 
     Returns:
         Process exit code, where `0` indicates the loading step completed
@@ -529,10 +643,12 @@ def main() -> int:
     result = assign_locations(result, grid_size_degrees=args.grid_size_degrees)
     max_gap_seconds = normalize_gap_limit(args.max_gap_seconds)
     probabilities = compute_location_probabilities(result, max_gap_seconds)
+    entropy_metrics = compute_entropy_metrics(probabilities)
     print(
         summarize_dataset(
             result,
             probabilities,
+            entropy_metrics,
             grid_size_degrees=args.grid_size_degrees,
             max_gap_seconds=max_gap_seconds,
         )
