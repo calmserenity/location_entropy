@@ -3,8 +3,9 @@
 This module currently implements the early data-preparation steps of the
 project: discovering raw trace files, parsing each GPS observation, sorting
 each user trace into ascending timestamp order, assigning discrete location
-cells, computing time-weighted location probabilities per user, and calculating
-location entropy from those probabilities.
+cells, computing time-weighted location probabilities per user, calculating
+location entropy from those probabilities, and building ranked per-user
+result rows for inspection.
 """
 
 from __future__ import annotations
@@ -149,6 +150,32 @@ class EntropyComputationResult:
     max_entropy: float
 
 
+@dataclass(frozen=True, slots=True)
+class UserResultRow:
+    """Flattened per-user result row for ranking and later visualization.
+
+    Attributes:
+        user_id: Cab identifier derived from the filename.
+        entropy: Shannon entropy in bits.
+        normalized_entropy: Entropy scaled to the `[0, 1]` range.
+        num_locations: Number of locations with non-zero probability mass.
+        top_location_share: Largest single-location probability for the user.
+        total_observed_seconds: Total dwell time used for probability
+            calculation.
+        transitions_used: Number of valid time intervals included.
+        transitions_skipped: Number of discarded intervals.
+    """
+
+    user_id: str
+    entropy: float
+    normalized_entropy: float
+    num_locations: int
+    top_location_share: float
+    total_observed_seconds: int
+    transitions_used: int
+    transitions_skipped: int
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the dataset loading step.
 
@@ -183,6 +210,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1800,
         help="Ignore trace intervals larger than this many seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--top-k-users",
+        type=int,
+        default=3,
+        help="Number of highest- and lowest-entropy users to include in the summary.",
     )
     return parser.parse_args()
 
@@ -562,12 +595,75 @@ def compute_entropy_metrics(
     )
 
 
+def build_user_result_rows(
+    probabilities: ProbabilityComputationResult,
+    entropy_metrics: EntropyComputationResult,
+) -> list[UserResultRow]:
+    """Build flattened result rows by combining probability and entropy outputs.
+
+    Args:
+        probabilities: Output from `compute_location_probabilities`.
+        entropy_metrics: Output from `compute_entropy_metrics`.
+
+    Returns:
+        A list of `UserResultRow` values, one per user.
+    """
+
+    probability_by_user = {
+        profile.user_id: profile for profile in probabilities.user_profiles
+    }
+    result_rows: list[UserResultRow] = []
+
+    for entropy_profile in entropy_metrics.user_entropy_profiles:
+        probability_profile = probability_by_user[entropy_profile.user_id]
+        result_rows.append(
+            UserResultRow(
+                user_id=entropy_profile.user_id,
+                entropy=entropy_profile.entropy,
+                normalized_entropy=entropy_profile.normalized_entropy,
+                num_locations=entropy_profile.num_locations,
+                top_location_share=entropy_profile.top_location_share,
+                total_observed_seconds=probability_profile.total_observed_seconds,
+                transitions_used=probability_profile.transitions_used,
+                transitions_skipped=probability_profile.transitions_skipped,
+            )
+        )
+
+    return result_rows
+
+
+def format_ranked_rows(rows: list[UserResultRow], title: str) -> list[str]:
+    """Format ranked user rows into a compact human-readable block.
+
+    Args:
+        rows: Ranked result rows to display.
+        title: Section heading for the ranked block.
+
+    Returns:
+        A list of summary lines ready to be joined into the CLI output.
+    """
+
+    lines = [title]
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            (
+                f"  {index}. {row.user_id} | entropy={row.entropy:.4f} | "
+                f"normalized={row.normalized_entropy:.4f} | "
+                f"locations={row.num_locations} | "
+                f"top_share={row.top_location_share:.4f}"
+            )
+        )
+    return lines
+
+
 def summarize_dataset(
     result: DatasetLoadResult,
     probabilities: ProbabilityComputationResult,
     entropy_metrics: EntropyComputationResult,
+    result_rows: list[UserResultRow],
     grid_size_degrees: float,
     max_gap_seconds: int | None,
+    top_k_users: int,
 ) -> str:
     """Build a short human-readable summary of the implemented steps.
 
@@ -575,8 +671,10 @@ def summarize_dataset(
         result: Output from `assign_locations`.
         probabilities: Output from `compute_location_probabilities`.
         entropy_metrics: Output from `compute_entropy_metrics`.
+        result_rows: Flattened per-user result rows.
         grid_size_degrees: Spatial bin size used for location assignment.
         max_gap_seconds: Optional upper bound used when filtering large gaps.
+        top_k_users: Number of highest- and lowest-entropy users to display.
 
     Returns:
         A multi-line string summarizing dataset size and one example trace.
@@ -599,39 +697,52 @@ def summarize_dataset(
         for record in trace.records
         if record.location_id is not None
     }
+    ranked_rows = sorted(result_rows, key=lambda row: row.entropy, reverse=True)
+    display_count = max(0, min(top_k_users, len(ranked_rows)))
+    highest_entropy_rows = ranked_rows[:display_count]
+    lowest_entropy_rows = list(reversed(ranked_rows[-display_count:]))
 
-    return "\n".join(
-        [
-            "Step 4 complete: location entropy calculation",
-            f"Users loaded: {len(result.traces)}",
-            f"Trace files processed: {result.files_seen}",
-            f"Rows loaded: {result.rows_loaded}",
-            f"Rows skipped: {result.rows_skipped}",
-            f"Grid size (degrees): {grid_size_degrees}",
-            f"Max gap filter (seconds): {max_gap_seconds if max_gap_seconds is not None else 'disabled'}",
-            f"Unique location cells: {len(unique_locations)}",
-            f"Observed seconds used: {probabilities.total_observed_seconds}",
-            f"Transitions used: {probabilities.transitions_used}",
-            f"Transitions skipped: {probabilities.transitions_skipped}",
-            f"Mean entropy: {entropy_metrics.mean_entropy:.4f}",
-            f"Min entropy: {entropy_metrics.min_entropy:.4f}",
-            f"Max entropy: {entropy_metrics.max_entropy:.4f}",
-            "",
-            f"Example user: {first_trace.user_id}",
-            f"Example records: {len(first_trace.records)}",
-            f"Example time range: {first_start} -> {first_end}",
-            f"Example first location cell: {first_location}",
-            f"Example observed seconds: {first_profile.total_observed_seconds}",
-            f"Example probability locations: {len(first_profile.location_probabilities)}",
-            f"Example top location share: {first_entropy.top_location_share:.4f}",
-            f"Example entropy: {first_entropy.entropy:.4f}",
-            f"Example normalized entropy: {first_entropy.normalized_entropy:.4f}",
-        ]
-    )
+    lines = [
+        "Step 5 complete: ranked per-user entropy results",
+        f"Users loaded: {len(result.traces)}",
+        f"Trace files processed: {result.files_seen}",
+        f"Rows loaded: {result.rows_loaded}",
+        f"Rows skipped: {result.rows_skipped}",
+        f"Grid size (degrees): {grid_size_degrees}",
+        f"Max gap filter (seconds): {max_gap_seconds if max_gap_seconds is not None else 'disabled'}",
+        f"Top/bottom users shown: {display_count}",
+        f"Unique location cells: {len(unique_locations)}",
+        f"Observed seconds used: {probabilities.total_observed_seconds}",
+        f"Transitions used: {probabilities.transitions_used}",
+        f"Transitions skipped: {probabilities.transitions_skipped}",
+        f"Mean entropy: {entropy_metrics.mean_entropy:.4f}",
+        f"Min entropy: {entropy_metrics.min_entropy:.4f}",
+        f"Max entropy: {entropy_metrics.max_entropy:.4f}",
+        "",
+        f"Example user: {first_trace.user_id}",
+        f"Example records: {len(first_trace.records)}",
+        f"Example time range: {first_start} -> {first_end}",
+        f"Example first location cell: {first_location}",
+        f"Example observed seconds: {first_profile.total_observed_seconds}",
+        f"Example probability locations: {len(first_profile.location_probabilities)}",
+        f"Example top location share: {first_entropy.top_location_share:.4f}",
+        f"Example entropy: {first_entropy.entropy:.4f}",
+        f"Example normalized entropy: {first_entropy.normalized_entropy:.4f}",
+    ]
+
+    if highest_entropy_rows:
+        lines.extend([""])
+        lines.extend(format_ranked_rows(highest_entropy_rows, "Highest entropy users"))
+
+    if lowest_entropy_rows:
+        lines.extend([""])
+        lines.extend(format_ranked_rows(lowest_entropy_rows, "Lowest entropy users"))
+
+    return "\n".join(lines)
 
 
 def main() -> int:
-    """Run the current step: load traces and compute location entropy.
+    """Run the current step: load traces and rank per-user entropy results.
 
     Returns:
         Process exit code, where `0` indicates the loading step completed
@@ -644,13 +755,16 @@ def main() -> int:
     max_gap_seconds = normalize_gap_limit(args.max_gap_seconds)
     probabilities = compute_location_probabilities(result, max_gap_seconds)
     entropy_metrics = compute_entropy_metrics(probabilities)
+    result_rows = build_user_result_rows(probabilities, entropy_metrics)
     print(
         summarize_dataset(
             result,
             probabilities,
             entropy_metrics,
+            result_rows,
             grid_size_degrees=args.grid_size_degrees,
             max_gap_seconds=max_gap_seconds,
+            top_k_users=args.top_k_users,
         )
     )
     return 0
