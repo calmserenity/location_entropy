@@ -1,14 +1,15 @@
 """Load and normalize Cabspotting traces for downstream entropy analysis.
 
-This module currently implements the first concrete step of the project:
-discovering raw trace files, parsing each GPS observation, sorting each user
-trace into ascending timestamp order, and printing a compact validation
-summary.
+This module currently implements the early data-preparation steps of the
+project: discovering raw trace files, parsing each GPS observation, sorting
+each user trace into ascending timestamp order, assigning discrete location
+cells, and computing time-weighted location probabilities per user.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -69,6 +70,46 @@ class DatasetLoadResult:
     rows_skipped: int
 
 
+@dataclass(frozen=True, slots=True)
+class UserLocationProfile:
+    """Time-weighted location distribution for one user.
+
+    Attributes:
+        user_id: Cab identifier derived from the filename.
+        dwell_seconds_by_location: Observed seconds attributed to each location.
+        location_probabilities: Normalized probability mass per location.
+        total_observed_seconds: Total valid dwell time used for probabilities.
+        transitions_used: Number of record-to-record intervals included.
+        transitions_skipped: Number of intervals skipped due to invalid timing or
+            gap filtering.
+    """
+
+    user_id: str
+    dwell_seconds_by_location: dict[str, int]
+    location_probabilities: dict[str, float]
+    total_observed_seconds: int
+    transitions_used: int
+    transitions_skipped: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityComputationResult:
+    """Dataset-level output for time-weighted location probabilities.
+
+    Attributes:
+        user_profiles: Per-user dwell-time and probability summaries.
+        total_observed_seconds: Sum of valid dwell time across all users.
+        transitions_used: Number of record-to-record intervals included.
+        transitions_skipped: Number of intervals skipped due to invalid timing or
+            gap filtering.
+    """
+
+    user_profiles: list[UserLocationProfile]
+    total_observed_seconds: int
+    transitions_used: int
+    transitions_skipped: int
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the dataset loading step.
 
@@ -97,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.005,
         help="Latitude/longitude grid size used to assign discrete locations.",
+    )
+    parser.add_argument(
+        "--max-gap-seconds",
+        type=int,
+        default=1800,
+        help="Ignore trace intervals larger than this many seconds. Use 0 to disable.",
     )
     return parser.parse_args()
 
@@ -301,14 +348,122 @@ def assign_locations(
     )
 
 
+def normalize_gap_limit(max_gap_seconds: int) -> int | None:
+    """Normalize the CLI gap limit into an internal optional value.
+
+    Args:
+        max_gap_seconds: Maximum allowed seconds between consecutive records.
+
+    Returns:
+        `None` if gap filtering is disabled, otherwise the positive gap limit.
+    """
+
+    return None if max_gap_seconds <= 0 else max_gap_seconds
+
+
+def compute_trace_location_profile(
+    trace: UserTrace, max_gap_seconds: int | None
+) -> UserLocationProfile:
+    """Compute dwell-time location probabilities for one user trace.
+
+    Args:
+        trace: One user's time-ordered trace with assigned location IDs.
+        max_gap_seconds: Optional upper bound for valid time gaps. Intervals
+            larger than this are skipped.
+
+    Returns:
+        A `UserLocationProfile` containing dwell times and normalized
+        probabilities for the user.
+
+    Raises:
+        ValueError: If a record is missing its assigned `location_id`.
+    """
+
+    dwell_seconds_by_location: defaultdict[str, int] = defaultdict(int)
+    transitions_used = 0
+    transitions_skipped = 0
+
+    for current_record, next_record in zip(trace.records, trace.records[1:]):
+        if current_record.location_id is None:
+            raise ValueError(
+                f"Trace '{trace.user_id}' is missing location IDs. Run location assignment first."
+            )
+
+        duration_seconds = next_record.timestamp - current_record.timestamp
+        if duration_seconds <= 0:
+            transitions_skipped += 1
+            continue
+
+        if max_gap_seconds is not None and duration_seconds > max_gap_seconds:
+            transitions_skipped += 1
+            continue
+
+        dwell_seconds_by_location[current_record.location_id] += duration_seconds
+        transitions_used += 1
+
+    total_observed_seconds = sum(dwell_seconds_by_location.values())
+    if total_observed_seconds == 0:
+        location_probabilities: dict[str, float] = {}
+    else:
+        location_probabilities = {
+            location_id: dwell_seconds / total_observed_seconds
+            for location_id, dwell_seconds in dwell_seconds_by_location.items()
+        }
+
+    return UserLocationProfile(
+        user_id=trace.user_id,
+        dwell_seconds_by_location=dict(dwell_seconds_by_location),
+        location_probabilities=location_probabilities,
+        total_observed_seconds=total_observed_seconds,
+        transitions_used=transitions_used,
+        transitions_skipped=transitions_skipped,
+    )
+
+
+def compute_location_probabilities(
+    result: DatasetLoadResult, max_gap_seconds: int | None
+) -> ProbabilityComputationResult:
+    """Compute time-weighted location probabilities across all loaded traces.
+
+    Args:
+        result: Output from `assign_locations`.
+        max_gap_seconds: Optional upper bound for valid time gaps. Intervals
+            larger than this are skipped.
+
+    Returns:
+        A `ProbabilityComputationResult` containing per-user location
+        distributions and aggregate interval counts.
+    """
+
+    user_profiles = [
+        compute_trace_location_profile(trace, max_gap_seconds)
+        for trace in result.traces
+    ]
+    return ProbabilityComputationResult(
+        user_profiles=user_profiles,
+        total_observed_seconds=sum(
+            profile.total_observed_seconds for profile in user_profiles
+        ),
+        transitions_used=sum(profile.transitions_used for profile in user_profiles),
+        transitions_skipped=sum(
+            profile.transitions_skipped for profile in user_profiles
+        ),
+    )
+
+
 def summarize_dataset(
-    result: DatasetLoadResult, grid_size_degrees: float
+    result: DatasetLoadResult,
+    probabilities: ProbabilityComputationResult,
+    grid_size_degrees: float,
+    max_gap_seconds: int | None,
 ) -> str:
     """Build a short human-readable summary of the implemented steps.
 
     Args:
-        result: Output from `load_dataset`.
+        result: Output from `assign_locations`.
+        probabilities: Output from `compute_location_probabilities`.
         grid_size_degrees: Spatial bin size used for location assignment.
+        max_gap_seconds: Optional upper bound used when filtering large gaps.
 
     Returns:
         A multi-line string summarizing dataset size and one example trace.
@@ -318,6 +473,7 @@ def summarize_dataset(
         return "No user traces were loaded."
 
     first_trace = result.traces[0]
+    first_profile = probabilities.user_profiles[0]
     first_start = first_trace.records[0].timestamp if first_trace.records else "n/a"
     first_end = first_trace.records[-1].timestamp if first_trace.records else "n/a"
     first_location = (
@@ -329,26 +485,39 @@ def summarize_dataset(
         for record in trace.records
         if record.location_id is not None
     }
+    top_location_share = (
+        max(first_profile.location_probabilities.values())
+        if first_profile.location_probabilities
+        else 0.0
+    )
 
     return "\n".join(
         [
+            "Step 3 complete: time-weighted location probabilities",
             f"Users loaded: {len(result.traces)}",
             f"Trace files processed: {result.files_seen}",
             f"Rows loaded: {result.rows_loaded}",
             f"Rows skipped: {result.rows_skipped}",
             f"Grid size (degrees): {grid_size_degrees}",
+            f"Max gap filter (seconds): {max_gap_seconds if max_gap_seconds is not None else 'disabled'}",
             f"Unique location cells: {len(unique_locations)}",
+            f"Observed seconds used: {probabilities.total_observed_seconds}",
+            f"Transitions used: {probabilities.transitions_used}",
+            f"Transitions skipped: {probabilities.transitions_skipped}",
             "",
             f"Example user: {first_trace.user_id}",
             f"Example records: {len(first_trace.records)}",
             f"Example time range: {first_start} -> {first_end}",
             f"Example first location cell: {first_location}",
+            f"Example observed seconds: {first_profile.total_observed_seconds}",
+            f"Example probability locations: {len(first_profile.location_probabilities)}",
+            f"Example top location share: {top_location_share:.4f}",
         ]
     )
 
 
 def main() -> int:
-    """Run the current step: load traces and assign discrete locations.
+    """Run the current step: load traces and compute location probabilities.
 
     Returns:
         Process exit code, where `0` indicates the loading step completed
@@ -358,7 +527,16 @@ def main() -> int:
     args = parse_args()
     result = load_dataset(args.data_dir, limit_users=args.limit_users)
     result = assign_locations(result, grid_size_degrees=args.grid_size_degrees)
-    print(summarize_dataset(result, grid_size_degrees=args.grid_size_degrees))
+    max_gap_seconds = normalize_gap_limit(args.max_gap_seconds)
+    probabilities = compute_location_probabilities(result, max_gap_seconds)
+    print(
+        summarize_dataset(
+            result,
+            probabilities,
+            grid_size_degrees=args.grid_size_degrees,
+            max_gap_seconds=max_gap_seconds,
+        )
+    )
     return 0
 
 
