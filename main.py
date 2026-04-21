@@ -5,12 +5,13 @@ project: discovering raw trace files, parsing each GPS observation, sorting
 each user trace into ascending timestamp order, assigning discrete location
 cells, computing time-weighted location probabilities per user, calculating
 location entropy from those probabilities, and building ranked per-user
-result rows for inspection.
+result rows for inspection and export.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import defaultdict
 import math
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "cabspottingdata"
+DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "outputs" / "location_entropy_results.csv"
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +178,19 @@ class UserResultRow:
     transitions_skipped: int
 
 
+@dataclass(frozen=True, slots=True)
+class ExportResult:
+    """Metadata describing a CSV export of per-user entropy results.
+
+    Attributes:
+        output_path: File path where the CSV was written.
+        rows_written: Number of result rows written to the CSV.
+    """
+
+    output_path: Path
+    rows_written: int
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the dataset loading step.
 
@@ -216,6 +231,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Number of highest- and lowest-entropy users to include in the summary.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=DEFAULT_OUTPUT_PATH,
+        help="CSV path used to export per-user entropy results.",
     )
     return parser.parse_args()
 
@@ -656,11 +677,58 @@ def format_ranked_rows(rows: list[UserResultRow], title: str) -> list[str]:
     return lines
 
 
+def export_result_rows(rows: list[UserResultRow], output_path: Path) -> ExportResult:
+    """Write flattened per-user result rows to a CSV file.
+
+    Args:
+        rows: Per-user entropy result rows to export.
+        output_path: Destination CSV path.
+
+    Returns:
+        An `ExportResult` describing the completed CSV export.
+    """
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_rows = sorted(rows, key=lambda row: row.entropy, reverse=True)
+    fieldnames = [
+        "rank",
+        "user_id",
+        "entropy",
+        "normalized_entropy",
+        "num_locations",
+        "top_location_share",
+        "total_observed_seconds",
+        "transitions_used",
+        "transitions_skipped",
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, row in enumerate(sorted_rows, start=1):
+            writer.writerow(
+                {
+                    "rank": rank,
+                    "user_id": row.user_id,
+                    "entropy": f"{row.entropy:.8f}",
+                    "normalized_entropy": f"{row.normalized_entropy:.8f}",
+                    "num_locations": row.num_locations,
+                    "top_location_share": f"{row.top_location_share:.8f}",
+                    "total_observed_seconds": row.total_observed_seconds,
+                    "transitions_used": row.transitions_used,
+                    "transitions_skipped": row.transitions_skipped,
+                }
+            )
+
+    return ExportResult(output_path=output_path, rows_written=len(sorted_rows))
+
+
 def summarize_dataset(
     result: DatasetLoadResult,
     probabilities: ProbabilityComputationResult,
     entropy_metrics: EntropyComputationResult,
     result_rows: list[UserResultRow],
+    export_result: ExportResult,
     grid_size_degrees: float,
     max_gap_seconds: int | None,
     top_k_users: int,
@@ -672,6 +740,7 @@ def summarize_dataset(
         probabilities: Output from `compute_location_probabilities`.
         entropy_metrics: Output from `compute_entropy_metrics`.
         result_rows: Flattened per-user result rows.
+        export_result: Metadata for the CSV export.
         grid_size_degrees: Spatial bin size used for location assignment.
         max_gap_seconds: Optional upper bound used when filtering large gaps.
         top_k_users: Number of highest- and lowest-entropy users to display.
@@ -703,7 +772,7 @@ def summarize_dataset(
     lowest_entropy_rows = list(reversed(ranked_rows[-display_count:]))
 
     lines = [
-        "Step 5 complete: ranked per-user entropy results",
+        "Step 6 complete: ranked per-user entropy export",
         f"Users loaded: {len(result.traces)}",
         f"Trace files processed: {result.files_seen}",
         f"Rows loaded: {result.rows_loaded}",
@@ -718,6 +787,8 @@ def summarize_dataset(
         f"Mean entropy: {entropy_metrics.mean_entropy:.4f}",
         f"Min entropy: {entropy_metrics.min_entropy:.4f}",
         f"Max entropy: {entropy_metrics.max_entropy:.4f}",
+        f"CSV export: {export_result.output_path}",
+        f"Rows exported: {export_result.rows_written}",
         "",
         f"Example user: {first_trace.user_id}",
         f"Example records: {len(first_trace.records)}",
@@ -742,7 +813,7 @@ def summarize_dataset(
 
 
 def main() -> int:
-    """Run the current step: load traces and rank per-user entropy results.
+    """Run the current step: export ranked per-user entropy results.
 
     Returns:
         Process exit code, where `0` indicates the loading step completed
@@ -756,12 +827,14 @@ def main() -> int:
     probabilities = compute_location_probabilities(result, max_gap_seconds)
     entropy_metrics = compute_entropy_metrics(probabilities)
     result_rows = build_user_result_rows(probabilities, entropy_metrics)
+    export_result = export_result_rows(result_rows, args.output_csv)
     print(
         summarize_dataset(
             result,
             probabilities,
             entropy_metrics,
             result_rows,
+            export_result,
             grid_size_degrees=args.grid_size_degrees,
             max_gap_seconds=max_gap_seconds,
             top_k_users=args.top_k_users,
