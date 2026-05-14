@@ -1,6 +1,6 @@
 <p style="color: red;"><strong>Warning:</strong> To view the interactive 3D visualisation, you must run <code>location_entropy_analysis.ipynb</code> locally and execute the Step 6 cells. The 3D Plotly output is not fully visible from the repository files alone.</p>
 
-View more at (Website)[https://calmserenity.github.io/location_entropy/]
+View more at [Website](https://calmserenity.github.io/location_entropy/)
 
 # Location Entropy Analysis
 
