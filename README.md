@@ -1,5 +1,7 @@
 <p style="color: red;"><strong>Warning:</strong> To view the interactive 3D visualisation, you must run <code>location_entropy_analysis.ipynb</code> locally and execute the Step 6 cells. The 3D Plotly output is not fully visible from the repository files alone.</p>
 
+View more at (Website)[https://calmserenity.github.io/location_entropy/]
+
 # Location Entropy Analysis
 
 This repository contains a notebook-based analysis of per-user location entropy on spatio-temporal mobility traces. The project computes entropy from time-weighted location probabilities, exports ranked user results, and generates explanatory visualizations, including an interactive 3D trajectory view.
